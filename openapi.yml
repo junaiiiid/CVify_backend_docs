@@ -1,0 +1,3553 @@
+openapi: 3.0.3
+info:
+  title: CVify 2.0 Backend API
+  description: |
+    Authentication API for CVify 2.0, served by Supabase Edge Functions.
+
+    ## Response envelope
+
+    Every endpoint — success or failure — returns the same JSON shape:
+
+    ```json
+    { "status_code": 200, "status": "success" | "failure", "data": { ... } }
+    ```
+
+    The HTTP status code mirrors `status_code`. On failure, `data.message`
+    contains a human-readable reason.
+  version: 0.1.0
+security:
+  - supabaseAnonKey: []
+servers:
+  - url: https://{projectRef}.supabase.co/functions/v1
+    description: Supabase Edge Functions
+    variables:
+      projectRef:
+        default: ptrqvbvuydfrnwbmxlxi
+        description: Supabase project ref
+paths:
+  /signUp:
+    post:
+      summary: Create a new account
+      description: |
+        Creates an `auth.users` row and (via trigger) a matching `public.users`
+        row with the provided `full_name`.
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SignUpRequest'
+      responses:
+        '200':
+          description: |
+            User created. If `data.email_verification_required` is `true`, a
+            6-digit code has been sent to the user's email — call `/verifyEmail`
+            next. `data.session` will be `null` in that case.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SignUpSuccessResponse'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '409':
+          description: |
+            An account with this email already exists. `data.code` will be
+            `EMAIL_ALREADY_REGISTERED`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '429':
+          description: |
+            More than 5 OTPs generated for this email in the last 24h.
+            `data.code` will be `OTP_RATE_LIMITED` and `data.retry_after_seconds`
+            tells the client when the next attempt is allowed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /login:
+    post:
+      summary: Sign in with email and password
+      description: |
+        If the account exists but the email is not verified yet, the server
+        automatically resends a 6-digit verification code and responds with
+        HTTP 403 and `data.code = "EMAIL_NOT_VERIFIED"`. The client should
+        navigate to the verification screen and call `/verifyEmail`.
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Authenticated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthSuccessResponse'
+        '401':
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '403':
+          description: |
+            Email not verified. A new OTP has been sent. `data.code` will be
+            `EMAIL_NOT_VERIFIED`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '429':
+          description: |
+            OTP generation rate-limit hit on the resend. `data.code` will be
+            `OTP_RATE_LIMITED`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /resendOTP:
+    post:
+      summary: Resend the email verification OTP
+      description: |
+        Sends a new 6-digit verification code to the given email. Returns the
+        same success message regardless of whether the account exists, to
+        prevent email enumeration.
+
+        Subject to the global OTP rate limit: 5 codes per email per rolling
+        24h across `/signUp`, `/login` (unverified), and `/resendOTP`.
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResendOTPRequest'
+      responses:
+        '200':
+          description: Resend request accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageSuccessResponse'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '429':
+          description: |
+            Rate-limited. `data.code` will be `OTP_RATE_LIMITED` and
+            `data.retry_after_seconds` indicates when the next attempt is
+            allowed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /signInWithGoogle:
+    post:
+      summary: Sign in or sign up with a Google ID token
+      description: |
+        Native OAuth flow for mobile/web. The client (e.g. Flutter
+        `google_sign_in` package) obtains a Google ID token, then sends it
+        here. The server verifies it against Google's keys and returns a
+        Supabase session.
+
+        Handles both sign-in and sign-up: Supabase creates the user on
+        first call and signs them in on subsequent calls. The
+        `data.is_new_user` flag tells the client which happened so the UI
+        can route accordingly.
+
+        For new users, the `public.users` row is created automatically
+        via the `on_auth_user_created` trigger, using the `name` field
+        from Google as `full_name`.
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GoogleAuthRequest'
+      responses:
+        '200':
+          description: Authenticated (existing or just-created user)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GoogleAuthSuccessResponse'
+        '401':
+          description: Invalid or expired Google ID token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /signInWithApple:
+    post:
+      summary: Sign in or sign up with an Apple identity token
+      description: |
+        Native OAuth flow for iOS/macOS. The client (e.g. Flutter
+        `sign_in_with_apple` package) obtains an Apple identity token and
+        raw nonce, then sends them here. The server verifies the token and
+        returns a Supabase session.
+
+        Handles both sign-in and sign-up: Supabase creates the user on the
+        first call and signs them in on subsequent calls. The
+        `data.is_new_user` flag tells the client which happened so the UI
+        can route accordingly.
+
+        **Apple name caveat:** Apple only returns the user's name on the
+        very first sign-in. The Flutter app must pass `full_name` on that
+        first call; the backend persists it immediately. On all subsequent
+        logins `full_name` may be omitted.
+
+        **Prerequisites:** Enable the Apple provider in
+        Supabase Dashboard → Authentication → Providers → Apple and supply
+        your Services ID, Team ID, Key ID, and private key.
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AppleAuthRequest'
+      responses:
+        '200':
+          description: Authenticated (existing or just-created user)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppleAuthSuccessResponse'
+        '400':
+          description: Missing required field
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: Invalid or expired Apple identity token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+
+  /forgotPassword:
+    post:
+      summary: Start the password reset flow
+      description: |
+        Sends a 6-digit recovery code to the given email. Returns the
+        same success message regardless of whether the account exists,
+        to prevent email enumeration.
+
+        Subject to the global OTP rate limit: 5 codes per email per
+        rolling 24h, shared across `/signUp`, `/login` (unverified),
+        `/resendOTP`, and `/forgotPassword`.
+
+        After receiving the email, the client should call `/resetPassword`
+        with the code and the new password.
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ForgotPasswordRequest'
+      responses:
+        '200':
+          description: Reset request accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageSuccessResponse'
+        '400':
+          description: |
+            Validation error, or the account is Google-only and cannot
+            reset a password (`data.code = "GOOGLE_ONLY_ACCOUNT"`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '429':
+          description: |
+            Rate-limited. `data.code` will be `OTP_RATE_LIMITED`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /resetPassword:
+    post:
+      summary: Complete password reset with OTP + new password
+      description: |
+        Verifies the 6-digit recovery code, sets the new password, and
+        signs the user in — returns the same shape as `/login`. The
+        client should treat the returned session as the new source of
+        truth and discard any previously stored tokens.
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResetPasswordRequest'
+      responses:
+        '200':
+          description: Password reset; fresh session returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthSuccessResponse'
+        '400':
+          description: |
+            Validation error, weak password, or invalid/expired OTP. When
+            the OTP is the cause, `data.code` will be `INVALID_OTP`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /changePassword:
+    post:
+      summary: Change the caller's password
+      description: |
+        Verifies `old_password`, sets `new_password`, and returns a fresh
+        session — same shape as `/login`.
+
+        Supabase invalidates all of the user's refresh tokens when the
+        password changes, so the server re-authenticates with the new
+        password and returns that brand-new session. Any existing tokens
+        the client was holding should be discarded in favour of the ones
+        in this response.
+      tags: [Auth]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangePasswordRequest'
+      responses:
+        '200':
+          description: Password changed; fresh session returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthSuccessResponse'
+        '400':
+          description: |
+            Validation error (missing fields, new == old, password fails
+            Supabase's strength requirements).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: |
+            Missing/invalid Bearer token, or `old_password` is incorrect.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /signOut:
+    post:
+      summary: Revoke refresh tokens (sign out)
+      description: |
+        Revokes refresh tokens for the authenticated caller. The current
+        access_token remains valid until its 1-hour expiry — JWTs are
+        stateless and cannot be revoked once issued. Clients **must**
+        clear local session state after calling this.
+
+        - `scope: "global"` (default) — revoke refresh tokens for **all**
+          the user's sessions (this device + every other device).
+        - `scope: "others"` — keep this session, revoke all others.
+      tags: [Auth]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SignOutRequest'
+      responses:
+        '200':
+          description: Signed out
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SignOutSuccessResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /verifyEmail:
+    post:
+      summary: Verify email with a 6-digit OTP
+      description: |
+        Confirms a newly-signed-up email address using the 6-digit code that
+        was emailed to the user. On success, returns a session — the user is
+        signed in immediately.
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyEmailRequest'
+      responses:
+        '200':
+          description: Email verified, session issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthSuccessResponse'
+        '400':
+          description: |
+            Invalid or expired OTP. `data.code` will be `INVALID_OTP`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /createCustomAiProfile:
+    post:
+      summary: Rewrite a profile using a free-form user instruction
+      description: |
+        Third AI Wizard mode. Instead of a job posting, the user provides a
+        single free-text instruction such as *"Optimise for iOS/Swift"*,
+        *"Pivot to fintech"*, or *"Make it more senior-grade"*. Gemini 2.5
+        Flash rewrites the profile around that intent and saves the result
+        as a new `public.profiles` row named `"<original> (Custom)"`.
+
+        Uses **`ai_wizard_mode3_credits`** (1 per user by default). Credits
+        are refunded on any failure after consumption.
+      tags: [AI]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCustomAiProfileRequest'
+      responses:
+        '200':
+          description: New profile created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateAiProfileSuccessResponse'
+        '400':
+          description: Validation error (missing field, invalid tone)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '402':
+          description: No mode-3 credits remaining (`data.code = "NO_CREDITS"`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '404':
+          description: Source profile not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '422':
+          description: Gemini returned an invalid structure (credit refunded)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '502':
+          description: Gemini API error (credit refunded)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /createLinkedinProfile:
+    post:
+      summary: Import a LinkedIn profile and save it
+      description: |
+        Scrapes the given LinkedIn URL via **ScrapeGraphAI** (JSON mode),
+        passes the result through a Gemini 2.5 Flash extraction prompt,
+        and saves the transformed data as a new `public.profiles` row.
+
+        `profile_name` is set to `"First Last"` from the scraped data
+        (or `"LinkedIn Profile"` if names are unavailable). `profile_color`
+        and `icon_asset` are left `null` for the user to set later via
+        `/updateUser`.
+
+        The endpoint typically takes **5–20 seconds** (ScrapeGraphAI
+        scrape + Gemini extraction). Show a loading indicator.
+      tags: [AI]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateLinkedinProfileRequest'
+      responses:
+        '200':
+          description: Profile imported and saved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateAiProfileSuccessResponse'
+        '400':
+          description: Missing/invalid linkedin_url
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '422':
+          description: Gemini returned an unrecognisable structure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '502':
+          description: ScrapeGraphAI or Gemini API error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /createAiProfile:
+    post:
+      summary: Generate an AI-optimised version of a profile for a target job
+      description: |
+        Fetches the specified profile, sends it together with the job
+        context to **Gemini 2.5 Flash** using the structured CV-rewrite
+        prompt, validates the response, and saves the result as a brand-new
+        profile row (new `id`, owner = caller).
+
+        **What changes**: `about_yourself`, `achievements`, `skills_list`
+        ordering, and other editorial text are rewritten/reordered for the
+        target role.
+
+        **What never changes**: `contact_details`, `id` (a new one is
+        assigned), `profile_color`, `icon_asset`, all dates, all employer /
+        institution / certificate names, all `languages_list` entries, and
+        all reference contact objects.
+
+        The saved profile's name is the source name with **" AI Wizard"**
+        appended so you can tell them apart in the list.
+
+        HTTP is used (not WebSocket): Gemini typically responds in 3–15 s;
+        the client should show a loading/progress indicator.
+      tags: [AI]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAiProfileRequest'
+      responses:
+        '200':
+          description: New AI profile saved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateAiProfileSuccessResponse'
+        '400':
+          description: Validation error (missing field, invalid tone)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '404':
+          description: Source profile not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '422':
+          description: |
+            Gemini response failed structural validation (entry count
+            mismatch, missing required keys, etc.). The bad output is
+            discarded — nothing is saved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '502':
+          description: Gemini API error or returned unparseable content
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /getCreditUtilization:
+    get:
+      summary: Get the caller's credit usage history and summary
+      description: |
+        Returns a full ledger of the caller's credit activity, plus a
+        summary of remaining, earned, and used credits.
+
+        Positive `amount` = credits received; negative = credits spent.
+      tags: [Credits]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      responses:
+        '200':
+          description: Credit utilization data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreditUtilizationSuccessResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /addACredit:
+    post:
+      summary: Add 1 credit to the calling user
+      description: |
+        Increments the authenticated user's `credits` by 1. Intended for
+        promotions, referrals, or free-credit flows initiated by the user.
+        Returns the new balance.
+      tags: [Credits]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      responses:
+        '200':
+          description: Credit added
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreditsSuccessResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /addCredits:
+    post:
+      summary: Add N credits to a user (admin only)
+      description: |
+        **Admin endpoint.** Increments `credits` for any user by the given
+        amount. Requires the Supabase **service role key** as the Bearer
+        token — calling this with a regular user JWT returns 403.
+
+        Intended for use after a payment is verified server-side.
+      tags: [Credits]
+      security:
+        - supabaseAnonKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminCreditRequest'
+      responses:
+        '200':
+          description: Credits added; returns updated balance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminCreditSuccessResponse'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '403':
+          description: Service role key not provided
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /setCredits:
+    post:
+      summary: Set a user's credits to an exact value (admin only)
+      description: |
+        **Admin endpoint.** Sets `credits` for any user to the specified
+        value. Requires the Supabase **service role key** as the Bearer
+        token.
+      tags: [Credits]
+      security:
+        - supabaseAnonKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminCreditRequest'
+      responses:
+        '200':
+          description: Credits set; returns new balance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminCreditSuccessResponse'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '403':
+          description: Service role key not provided
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /verifyPurchase:
+    post:
+      summary: Verify a Google Play purchase and credit the user
+      description: |
+        Verifies a Google Play purchase token server-side (service account
+        credentials never leave the server) and adds credits. Supports
+        `inapp` (one-time) and `subs` (subscription initial purchase).
+        Replay-proof: each `purchase_token` can only be redeemed once.
+
+        **Supported product IDs**
+
+        Subscriptions (`purchase_type: "subs"`):
+        - `cvify_pro_monthly` — 25 credits/month
+        - `cvify_max_monthly` — 50 credits/month
+
+        One-time packs (`purchase_type: "inapp"`):
+        - `cvify_credits_25` — 25 credits
+        - `cvify_credits_50` — 50 credits
+        - `cvify_credits_75` — 75 credits
+        - `cvify_credits_100` — 100 credits
+      tags: [Credits]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyPurchaseRequest'
+      responses:
+        '200':
+          description: Purchase verified and credits added
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerifyPurchaseSuccessResponse'
+        '400':
+          description: Unknown product, invalid state, or validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '409':
+          description: Token already redeemed (code = ALREADY_REDEEMED)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '502':
+          description: Google Play API error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /getCredits:
+    get:
+      summary: Get the caller's AI Wizard credit balances
+      tags: [AI]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      responses:
+        '200':
+          description: Credit balances
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreditsSuccessResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /getAppContent:
+    get:
+      summary: Get app navigation, quick actions, and feature flags
+      description: |
+        Dynamic content for the home screen. Callable with or without
+        authentication:
+
+        - **Authenticated** (valid Bearer token): `isOffline` is `false`,
+          full navigation including the AI tab. The "Manage Profiles"
+          quick action's `description` reflects the caller's real profile
+          count (`"3 Profiles"`, `"1 Profile"`, …).
+        - **Anonymous** (no Bearer, or invalid one): `isOffline` is `true`,
+          AI tab stripped from `navigation_bar_data`, profile / CV counts
+          default to `0`.
+
+        "Manage CVs" description now reports the caller's real export
+        count (via the `public.exports` table — incremented every time
+        `/export` succeeds).
+
+        An invalid token does NOT error — the endpoint silently downgrades
+        to anonymous mode.
+      tags: [App]
+      security:
+        - supabaseAnonKey: []
+        - supabaseAnonKey: []
+          bearerAuth: []
+      responses:
+        '200':
+          description: App content
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppContentSuccessResponse'
+  /deleteUser:
+    delete:
+      summary: Permanently delete the caller's account
+      description: |
+        **Destructive and irreversible.** Removes everything tied to the
+        authenticated caller:
+
+        - the `auth.users` row (cascades to `public.users` and any
+          future tables FK'd to it with `on delete cascade`)
+        - all files under `profile_pictures/{user_id}/` in storage
+        - all OTP rate-limit records for this email
+
+        The current access token is invalidated as soon as the call
+        succeeds; the client should clear local session state and route
+        back to sign-in / landing.
+
+        Cleanup steps are best-effort. The auth-user deletion is the
+        critical step — if it fails, an HTTP 500 is returned and the
+        account is not yet deleted.
+      tags: [User]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      responses:
+        '200':
+          description: Account deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteUserSuccessResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '500':
+          description: Auth-user deletion failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /updateUser:
+    patch:
+      summary: Update the caller's profile fields
+      description: |
+        Partial update of `public.users` for the authenticated caller.
+        Send only the fields you want to change. Unknown or immutable
+        fields (including `email`, `id`, `created_at`) are rejected with
+        HTTP 400.
+
+        To clear a field, send its value as `null`.
+
+        Email change is not supported here — that requires Supabase's
+        own re-verification flow (`auth.updateUser`) and is out of scope.
+      tags: [User]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserRequest'
+      responses:
+        '200':
+          description: Updated row
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateUserSuccessResponse'
+        '400':
+          description: Validation error (unknown field, email attempt, empty body)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /createUpdateProfile:
+    post:
+      summary: Create or update a CV profile (multipart, with optional contact image)
+      description: |
+        **Multipart** endpoint. Two fields:
+
+        - **`data`** (required): a JSON-encoded string of the profile
+          payload (same shape as `ProfileUpsertRequest`). Optional `id`
+          toggles create vs. update.
+        - **`image`** (optional): a binary file — `image/jpeg`,
+          `image/png`, or `image/webp`, up to 5 MB. When present, the
+          server uploads it to the `pictures` bucket at
+          `{user_id}/{profile_id}/contact.{ext}` and writes the resulting
+          public URL into `contact_details.image_path` of the stored row.
+
+        Behavior matrix:
+
+        | id sent? | image sent? | result |
+        |---|---|---|
+        | no  | no  | create empty profile |
+        | no  | yes | create + upload image, `image_path` populated |
+        | yes | no  | patch fields you sent |
+        | yes | yes | patch fields you sent; if `contact_details` is omitted, existing one is preserved and only `image_path` is updated |
+
+        Server-managed fields (`user_id`, `created_at`, `updated_at`)
+        cannot be set from the body — sending them returns 400. RLS
+        enforces ownership on update — patching a profile you don't own
+        returns the same 404 as "doesn't exist".
+      tags: [Profile]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [data]
+              properties:
+                data:
+                  type: string
+                  description: |
+                    JSON-encoded `ProfileUpsertRequest`. The Swagger UI
+                    "Try it out" treats this as a plain string field —
+                    paste your JSON as one line.
+                  example: '{"profile_name":"Software Engineer","skills_list":["Dart","TypeScript"]}'
+                image:
+                  type: string
+                  format: binary
+                  description: |
+                    Optional contact image. Accepts **any common format**
+                    including HEIF/HEIC (iPhone default), JPEG, PNG, WebP,
+                    GIF, BMP, and TIFF. Max input 25 MB.
+
+                    Server processing before storage:
+
+                    1. Decode (HEIF via wasm, others via ImageScript).
+                    2. Downscale to a max of 2048 px on the longest side.
+                    3. Iteratively re-encode to JPEG, dropping quality and
+                       then resizing further until the output is **≤ 4 MB**.
+
+                    The stored file is always JPEG at
+                    `pictures/{user_id}/{profile_id}/contact.jpg`. The URL
+                    written into `contact_details.image_path` reflects that.
+      responses:
+        '200':
+          description: Created or updated row
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProfileSuccessResponse'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '404':
+          description: |
+            Update target not found (either profile doesn't exist, or
+            doesn't belong to caller — these are intentionally
+            indistinguishable).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /getAllProfiles:
+    get:
+      summary: List the caller's profiles (paginated)
+      description: |
+        Returns a page of the caller's `public.profiles` rows, sorted by
+        `updated_at` desc. RLS limits results to the caller.
+
+        Filtering:
+        - default (no param or `archived=false`) → **active** profiles
+        - `archived=true` → **archived** profiles
+
+        Pagination via `limit` (default 20, max 100) and `offset`
+        (default 0). Response wraps results in `{ items, total, limit,
+        offset }`.
+      tags: [Profile]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      parameters:
+        - name: archived
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: Paginated profiles
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedProfilesResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '500':
+          description: Database error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /export:
+    post:
+      summary: Save an export (a CV render)
+      description: |
+        Inserts a new row into `public.exports`. The `data` field is an
+        arbitrary JSON blob — the frontend decides what to store (PDF
+        URL, full profile snapshot, render metadata, etc.). Successful
+        calls bump the caller's "Manage CVs" count returned by
+        `/getAppContent`.
+
+        Exports are write-once from the API's perspective: no update or
+        delete endpoints are exposed yet.
+      tags: [Export]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExportRequest'
+      responses:
+        '200':
+          description: Created export row
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExportSuccessResponse'
+        '400':
+          description: Validation error (missing profile_id, etc.)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /searchProfiles:
+    get:
+      summary: Search the caller's profiles
+      description: |
+        Case-insensitive search across `profile_name`,
+        `profile_description`, `contact_details.first_name`,
+        `contact_details.last_name`, and
+        `about_yourself.professional_title`. RLS limits results to the
+        caller.
+
+        Pagination via `limit` / `offset`. Use `archived=true` to search
+        archived profiles instead of active ones.
+      tags: [Profile]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+          description: |
+            Search text. Characters `, ( ) ' " %` are stripped before
+            matching to keep the postgrest filter chain safe.
+        - name: archived
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: Paginated matching profiles
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedProfilesResponse'
+        '400':
+          description: Missing/empty `q` or invalid pagination params
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /searchExports:
+    get:
+      summary: Search the caller's exports
+      description: |
+        Case-insensitive ILIKE search inside the export `data` JSONB
+        (matched against the generated `data_text` column, which is the
+        JSON serialization). Optional `profile_id` further narrows to
+        exports tied to one profile. RLS limits results to the caller.
+
+        Pagination via `limit` / `offset`.
+      tags: [Export]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: profile_id
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: Paginated matching exports
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedExportsResponse'
+        '400':
+          description: Missing/empty `q` or invalid pagination params
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /deleteExportById:
+    delete:
+      summary: Permanently delete an export
+      description: |
+        Hard-deletes one row from `public.exports`. Irreversible. RLS
+        prevents deleting exports you don't own — foreign ids return 404
+        indistinguishable from "doesn't exist". Subsequent
+        `/getAppContent` and `/getAllRecentExports` calls reflect the
+        lower count immediately.
+      tags: [Export]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      parameters:
+        - name: id
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteExportSuccessResponse'
+        '400':
+          description: Missing `id` query param
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '404':
+          description: Export not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /getExportById:
+    get:
+      summary: Get a specific export by id
+      description: |
+        Returns one row from `public.exports`. RLS limits access to the
+        caller's own exports — fetching someone else's id returns the
+        same 404 as "doesn't exist".
+      tags: [Export]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      parameters:
+        - name: id
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Export row
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExportSuccessResponse'
+        '400':
+          description: Missing `id` query param
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '404':
+          description: Export not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /getAllRecentExports:
+    get:
+      summary: List the caller's recent exports (paginated)
+      description: |
+        Returns a page of the caller's `public.exports` rows ordered by
+        `created_at` desc. RLS filters to the caller's own.
+
+        Pagination via `limit` (default 20, max 100) and `offset`
+        (default 0). Response wraps results in `{ items, total, limit,
+        offset }`.
+      tags: [Export]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: Paginated exports
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedExportsResponse'
+        '400':
+          description: Invalid `limit` value
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '500':
+          description: Database error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /getProfileById:
+    get:
+      summary: Get a profile by id
+      description: |
+        Returns the full profile document. Caller must own the row;
+        ownership is enforced by RLS. Non-existent and not-yours both
+        return 404.
+      tags: [Profile]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      parameters:
+        - name: id
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Profile row
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProfileSuccessResponse'
+        '400':
+          description: Missing `id` query param
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '404':
+          description: Profile not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /archiveProfile:
+    post:
+      summary: Archive (or unarchive) a profile
+      description: |
+        Toggles the `archived` flag on the caller's profile. Archived
+        profiles are excluded from `/getAllProfiles` by default but can
+        be retrieved via `/getAllProfiles?archived=true`.
+
+        - Body `{ "id": "<uuid>" }` → sets `archived = true` (default).
+        - Body `{ "id": "<uuid>", "archived": false }` → unarchives.
+
+        `archived` is *not* settable via `/createUpdateProfile`; this is
+        the only endpoint that toggles it.
+      tags: [Profile]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ArchiveProfileRequest'
+      responses:
+        '200':
+          description: Updated row
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProfileSuccessResponse'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '404':
+          description: Profile not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /unarchiveProfile:
+    post:
+      summary: Unarchive a profile
+      description: |
+        Sets `archived = false` on the caller's profile. Functionally
+        equivalent to `POST /archiveProfile { id, archived: false }` —
+        provided as a separate endpoint so client routing stays
+        symmetric.
+      tags: [Profile]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UnarchiveProfileRequest'
+      responses:
+        '200':
+          description: Updated row
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProfileSuccessResponse'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '404':
+          description: Profile not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /duplicateProfile:
+    post:
+      summary: Clone an existing profile
+      description: |
+        Creates a new profile that's an exact copy of an existing one,
+        with a new `id`, new `created_at`/`updated_at`, `archived = false`,
+        and `profile_name` suffixed with ` (Copy)`. The contact image
+        is copied to the new profile's storage path so deleting the
+        source doesn't break the duplicate.
+      tags: [Profile]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DuplicateProfileRequest'
+      responses:
+        '200':
+          description: New duplicate row
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProfileSuccessResponse'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '404':
+          description: Source profile not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /deleteProfileById:
+    delete:
+      summary: Permanently delete a profile
+      description: |
+        Hard-deletes the row and removes any files in
+        `pictures/{user_id}/{profile_id}/`. Irreversible. RLS prevents
+        deleting profiles you don't own (returns 404 indistinguishable
+        from "doesn't exist").
+
+        If you want a recoverable delete instead, use `/archiveProfile`.
+      tags: [Profile]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      parameters:
+        - name: id
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteProfileSuccessResponse'
+        '400':
+          description: Missing `id` query param
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '404':
+          description: Profile not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /uploadProfilePicture:
+    post:
+      summary: Upload the caller's profile picture
+      description: |
+        Uploads an image to the `profile_pictures` bucket and writes its
+        public URL into `public.users.profile_picture_url` for the
+        authenticated caller.
+
+        Storage path is `{user_id}/avatar.{ext}` — re-uploads overwrite.
+        The returned URL has a cache-busting `?t=` param so clients see
+        the new image immediately.
+
+        Constraints: max 5 MB; content type must be `image/jpeg`,
+        `image/png`, or `image/webp`.
+      tags: [User]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: Image file (jpeg / png / webp, max 5 MB)
+      responses:
+        '200':
+          description: Uploaded; profile_picture_url updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadProfilePictureSuccessResponse'
+        '400':
+          description: Validation error (missing file, bad type, too large)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '500':
+          description: Upload or DB write failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /getUser:
+    get:
+      summary: Get the current user's profile row
+      description: |
+        Returns the row in `public.users` for the authenticated caller.
+        Requires a valid Bearer `access_token` in addition to the standard
+        `apikey` header.
+
+        The query runs as the authenticated user, so the existing RLS
+        policy (`auth.uid() = id`) guarantees the caller can only see
+        their own row.
+      tags: [User]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      responses:
+        '200':
+          description: User profile row
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserRowSuccessResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /refreshToken:
+    post:
+      summary: Exchange a refresh token for a new session
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshTokenRequest'
+      responses:
+        '200':
+          description: New session issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthSuccessResponse'
+        '401':
+          description: Invalid or expired refresh token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+  /submitFeedback:
+    post:
+      summary: Submit user feedback with optional screenshot / screen recording
+      description: |
+        **Multipart endpoint.** Stores feedback and sends an email to
+        `info@flutterninja.com` via a Resend template. Attachments are
+        uploaded directly in the same request and stored in the
+        `feedback-attachments` bucket (public read).
+
+        **Anonymous calls are supported** — omit the `Authorization` header
+        entirely. If a valid Bearer token is provided the feedback is
+        attributed to that user; otherwise `user_id` is stored as `null`.
+
+        Fields:
+        - **`data`** (required): JSON-encoded feedback body.
+        - **`screenshot`** (optional): image — jpeg, png, webp, heic/heif — max **10 MB**.
+        - **`screen_recording`** (optional): video — mp4, webm, mov — max **50 MB**.
+
+        `diagnostics`, `logs`, `screenshot`, and `screen_recording` are
+        only meaningful for `type = "bug"` — they are silently ignored for
+        other types.
+      tags: [Feedback]
+      security:
+        - supabaseAnonKey: []
+        - supabaseAnonKey: []
+          bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [data]
+              properties:
+                data:
+                  type: string
+                  description: JSON-encoded `SubmitFeedbackRequest`.
+                  example: '{"type":"bug","message":"App crashes on export"}'
+                screenshot:
+                  type: string
+                  format: binary
+                  description: Optional screenshot (jpeg/png/webp/heic, max 10 MB)
+                screen_recording:
+                  type: string
+                  format: binary
+                  description: Optional screen recording (mp4/webm/mov, max 50 MB)
+      responses:
+        '200':
+          description: Feedback stored and email queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FeedbackSuccessResponse'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: Bearer token was provided but is invalid or expired
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+
+  /syncProfiles:
+    post:
+      summary: Bulk-import offline profiles after account creation
+      description: |
+        Accepts up to **100** profiles created while the user was offline
+        and inserts them into the database under the authenticated user's
+        account. Designed to be called once immediately after sign-up to
+        migrate locally-stored data.
+
+        Pass the same UUIDs your offline store already uses — they are
+        preserved server-side so `/syncExports` can reference them directly
+        via `profile_id` without any ID remapping.
+
+        Re-syncing is safe: records whose `id` already exists are silently
+        skipped (`ON CONFLICT DO NOTHING`).
+      tags: [Sync]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SyncProfilesRequest'
+      responses:
+        '200':
+          description: Profiles synced
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncProfilesSuccessResponse'
+        '400':
+          description: Validation error (empty array, too many profiles, etc.)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+
+  /syncExports:
+    post:
+      summary: Bulk-import offline export records after account creation
+      description: |
+        Accepts up to **500** export records created while the user was
+        offline and inserts them into the database. Call this **after**
+        `/syncProfiles` so that `profile_id` references resolve correctly.
+
+        Pass the same UUIDs your offline store uses for both `id` and
+        `profile_id`. Re-syncing is safe: duplicates are silently skipped.
+      tags: [Sync]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SyncExportsRequest'
+      responses:
+        '200':
+          description: Exports synced
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncExportsSuccessResponse'
+        '400':
+          description: Validation error (empty array, too many exports, etc.)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+
+  /registerDevice:
+    post:
+      summary: Register an FCM device token for the authenticated user
+      description: |
+        Upserts the device's FCM token so the backend can send personalised
+        push notifications. Call on every app start when the user is signed in
+        and immediately after any successful authentication. Idempotent.
+      tags: [Notifications]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterDeviceRequest'
+      responses:
+        '200':
+          description: Device registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleSuccessResponse'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+
+  /unregisterDevice:
+    delete:
+      summary: Remove an FCM device token (call on logout)
+      tags: [Notifications]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      parameters:
+        - name: fcm_token
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Token removed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleSuccessResponse'
+        '400':
+          description: Missing fcm_token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+
+  /getSettings:
+    get:
+      summary: Get the caller's notification preferences
+      description: |
+        Returns the stored preferences, or defaults (`true` for all, 9am–9pm
+        reminder window) if the user has never saved settings.
+      tags: [Notifications]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      responses:
+        '200':
+          description: Notification settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationSettingsResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+
+  /setSettings:
+    patch:
+      summary: Update the caller's notification preferences
+      description: Partial update — send only the fields you want to change.
+      tags: [Notifications]
+      security:
+        - supabaseAnonKey: []
+          bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetSettingsRequest'
+      responses:
+        '200':
+          description: Updated settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationSettingsResponse'
+        '400':
+          description: Validation error or nothing to update
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '401':
+          description: Missing or invalid Bearer token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+
+  /sendMarketingEmail:
+    post:
+      summary: Queue a marketing email blast (admin only)
+      description: |
+        **Admin endpoint — requires the Supabase service role key as Bearer.**
+        Queues an HTML marketing email to all opted-in users, or to a specific
+        subset via `user_ids`. The email queue is flushed every 5 minutes by
+        the `/processEmailQueue` cron worker.
+      tags: [Admin]
+      security:
+        - supabaseAnonKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendMarketingEmailRequest'
+      responses:
+        '200':
+          description: Emails queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcessQueueSuccessResponse'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '403':
+          description: Service role key not provided
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+
+  /sendFeatureNotification:
+    post:
+      summary: Queue a feature-announcement push to all opted-in users (admin only)
+      description: |
+        **Admin endpoint — requires the Supabase service role key as Bearer.**
+        Queues a push notification to every registered device whose owner has
+        not opted out of feature announcements. The push queue is flushed every
+        5 minutes by `/processPushQueue`.
+      tags: [Admin]
+      security:
+        - supabaseAnonKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendFeatureNotificationRequest'
+      responses:
+        '200':
+          description: Notifications queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcessQueueSuccessResponse'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+        '403':
+          description: Service role key not provided
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+
+  /processEmailQueue:
+    get:
+      summary: Flush pending emails via Resend (cron / admin trigger)
+      description: |
+        **Admin endpoint — requires the Supabase service role key as Bearer.**
+        Processes up to 50 pending `email_queue` rows per call. Marks each row
+        `sent` or `failed` (retried up to 3 times). Scheduled every 5 minutes
+        by pg_cron; can also be triggered manually for testing.
+      tags: [Admin]
+      security:
+        - supabaseAnonKey: []
+      responses:
+        '200':
+          description: Queue flushed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcessQueueSuccessResponse'
+        '403':
+          description: Service role key not provided
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+
+  /processPushQueue:
+    get:
+      summary: Flush pending push notifications via FCM (cron / admin trigger)
+      description: |
+        **Admin endpoint — requires the Supabase service role key as Bearer.**
+        Processes up to 100 pending `push_notification_queue` rows. Stale tokens
+        (UNREGISTERED / NOT_FOUND) are automatically removed from `user_devices`.
+        Scheduled every 5 minutes by pg_cron.
+      tags: [Admin]
+      security:
+        - supabaseAnonKey: []
+      responses:
+        '200':
+          description: Queue flushed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcessQueueSuccessResponse'
+        '403':
+          description: Service role key not provided
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+
+  /scheduleEngagementReminders:
+    get:
+      summary: Enqueue engagement reminder pushes for eligible users (hourly cron)
+      description: |
+        **Admin endpoint — requires the Supabase service role key as Bearer.**
+        Checks every opted-in user whose `reminders_start_hour`–`reminders_end_hour`
+        window covers the current UTC hour, skips anyone who already has a pending
+        reminder, then enqueues one push per eligible device. Scheduled hourly by
+        pg_cron.
+      tags: [Admin]
+      security:
+        - supabaseAnonKey: []
+      responses:
+        '200':
+          description: Reminders enqueued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcessQueueSuccessResponse'
+        '403':
+          description: Service role key not provided
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+
+  /handleSubscriptionRenewal:
+    post:
+      summary: Receive Google Play subscription RTDN via Cloud Pub/Sub
+      description: |
+        **Webhook — do not call directly.** Receives Real-time Developer
+        Notifications (RTDN) from Google Cloud Pub/Sub whenever a subscription
+        event occurs on Google Play.
+
+        **One-time setup in Google Cloud Console:**
+        1. Create a Pub/Sub topic in your Firebase project.
+        2. Add a push subscription pointing to this endpoint URL.
+        3. In Google Play Console → Monetization setup → Real-time developer
+           notifications, enter the Pub/Sub topic name.
+
+        **Handled notification types:**
+
+        | Type | Action |
+        |---|---|
+        | 2 RENEWED | Grant monthly credits + extend subscription_expires_at by 31 days |
+        | 1 RECOVERED | Same as RENEWED |
+        | 7 RESTARTED | Same as RENEWED |
+        | 3 CANCELED | Acknowledge only — user keeps access until expiry |
+        | 12 REVOKED | Clear subscription_tier immediately |
+        | 13 EXPIRED | Clear subscription_tier immediately |
+        | All others | Acknowledge, no action |
+      tags: [Admin]
+      security:
+        - supabaseAnonKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Google Cloud Pub/Sub push message envelope
+              properties:
+                message:
+                  type: object
+                  properties:
+                    data:
+                      type: string
+                      description: Base64-encoded JSON SubscriptionNotification payload
+                subscription:
+                  type: string
+      responses:
+        '200':
+          description: Notification acknowledged (regardless of whether action was taken)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleSuccessResponse'
+        '400':
+          description: Malformed Pub/Sub envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FailureResponse'
+
+components:
+  securitySchemes:
+    supabaseAnonKey:
+      type: apiKey
+      in: header
+      name: apikey
+      description: |
+        Supabase project anon (publishable) key. Required by the Supabase API
+        gateway for every request. This is pre-filled in the docs UI.
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        User `access_token` returned by /login, /signUp, or /refreshToken.
+        Click **Authorize** once and every protected endpoint will send it.
+  schemas:
+    SignUpRequest:
+      type: object
+      required: [email, password, full_name]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          format: password
+          minLength: 6
+        full_name:
+          type: string
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          format: password
+    RefreshTokenRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+    VerifyEmailRequest:
+      type: object
+      required: [email, token]
+      properties:
+        email:
+          type: string
+          format: email
+        token:
+          type: string
+          description: 6-digit OTP from the verification email
+          example: "123456"
+    ForgotPasswordRequest:
+      type: object
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+    ResetPasswordRequest:
+      type: object
+      required: [email, token, new_password]
+      properties:
+        email:
+          type: string
+          format: email
+        token:
+          type: string
+          description: 6-digit OTP from the recovery email
+          example: "123456"
+        new_password:
+          type: string
+          format: password
+          minLength: 6
+    ChangePasswordRequest:
+      type: object
+      required: [old_password, new_password]
+      properties:
+        old_password:
+          type: string
+          format: password
+        new_password:
+          type: string
+          format: password
+          minLength: 6
+    SignOutRequest:
+      type: object
+      properties:
+        scope:
+          type: string
+          enum: [global, others]
+          default: global
+          description: |
+            * `global` — revoke refresh tokens for all sessions
+              (this device + all others).
+            * `others` — revoke all sessions except this one.
+    SignOutSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code:
+          type: integer
+          example: 200
+        status:
+          type: string
+          enum: [success]
+        data:
+          type: object
+          properties:
+            signed_out:
+              type: boolean
+              example: true
+            scope:
+              type: string
+              enum: [global, others]
+    CreditsSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code:
+          type: integer
+          example: 200
+        status:
+          type: string
+          enum: [success]
+        data:
+          type: object
+          properties:
+            credits:
+              type: integer
+              description: Remaining AI Wizard credits.
+            earned_credits:
+              type: integer
+              description: Number of ads watched in the last 24 hours (max 2).
+            limit_reached:
+              type: boolean
+              description: |
+                `true` when the user has watched 2 ads in the last 24 hours
+                (daily limit is now 2).
+                `/addACredit` will return 429 `AD_LIMIT_REACHED` until the
+                window resets.
+            subscription_tier:
+              type: string
+              nullable: true
+              enum: [pro, max]
+              description: "null if no active subscription"
+            subscription_expires_at:
+              type: string
+              format: date-time
+              nullable: true
+            is_subscribed:
+              type: boolean
+              description: "true when tier is set and expires_at is in the future"
+    CreateCustomAiProfileRequest:
+      type: object
+      required: [profile_id, user_prompt]
+      properties:
+        profile_id:
+          type: string
+          format: uuid
+          description: Source profile to rewrite.
+        user_prompt:
+          type: string
+          description: |
+            Free-text instruction for the rewrite. Examples:
+            "Optimise for iOS/Swift development",
+            "Pivot to a fintech backend role",
+            "Make it more senior-grade",
+            "Emphasise AI and LLM integrations".
+          example: Optimise for a senior iOS/Swift engineering role at a startup
+        tone:
+          type: string
+          enum: [professional, modern, executive, technical]
+          default: professional
+          description: Optional. Defaults to `professional` if omitted.
+    CreditUtilizationEntry:
+      type: object
+      properties:
+        id:
+          type: integer
+        amount:
+          type: integer
+          description: Positive = earned, negative = spent.
+        category:
+          type: string
+          description: |
+            Human-readable label, e.g. "Tailored CV for a job",
+            "Imported profile via LinkedIn", "Polished CV using prompts",
+            "Watched an AD", "Monthly credits", "Sign up bonus".
+        created_at:
+          type: string
+          format: date-time
+    CreditUtilizationSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code:
+          type: integer
+          example: 200
+        status:
+          type: string
+          enum: [success]
+        data:
+          type: object
+          properties:
+            credits_remaining:
+              type: integer
+            credits_earned:
+              type: integer
+            credits_used:
+              type: integer
+            history:
+              type: array
+              items:
+                $ref: '#/components/schemas/CreditUtilizationEntry'
+    VerifyPurchaseRequest:
+      type: object
+      required: [purchase_token, product_id]
+      properties:
+        purchase_token:
+          type: string
+          description: |
+            Platform-specific purchase identifier:
+            - **Android:** the token returned by the Google Play Billing SDK.
+            - **iOS:** the StoreKit transaction ID (`transactionId` from StoreKit2,
+              or `purchaseID` / `transactionIdentifier` from the `in_app_purchase`
+              plugin).
+        product_id:
+          type: string
+          description: |
+            Product ID configured in Google Play Console **and** App Store Connect
+            (same IDs on both stores). Must be one of:
+            - `cvify_pro_monthly` (subs — 25 credits/month)
+            - `cvify_max_monthly` (subs — 50 credits/month)
+            - `cvify_credits_25` (inapp — 25 credits)
+            - `cvify_credits_50` (inapp — 50 credits)
+            - `cvify_credits_75` (inapp — 75 credits)
+            - `cvify_credits_100` (inapp — 100 credits)
+        purchase_type:
+          type: string
+          enum: [inapp, subs]
+          default: inapp
+        platform:
+          type: string
+          enum: [android, ios]
+          default: android
+          description: |
+            Which store the purchase originated from. Determines whether the
+            server verifies against Google Play Android Publisher API or
+            Apple's App Store Server API. Defaults to `android` for backwards
+            compatibility with existing clients.
+    VerifyPurchaseSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code:
+          type: integer
+          example: 200
+        status:
+          type: string
+          enum: [success]
+        data:
+          type: object
+          properties:
+            credits:
+              type: integer
+            credits_added:
+              type: integer
+            product_id:
+              type: string
+            subscription_tier:
+              type: string
+              nullable: true
+              enum: [pro, max]
+              description: "'pro' | 'max' | null — null for one-time purchases"
+            subscription_expires_at:
+              type: string
+              format: date-time
+              nullable: true
+              description: ISO 8601 expiry timestamp; null for one-time purchases
+    AdminCreditRequest:
+      type: object
+      required: [user_id, credits]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        credits:
+          type: integer
+          minimum: 0
+    AdminCreditSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code:
+          type: integer
+          example: 200
+        status:
+          type: string
+          enum: [success]
+        data:
+          type: object
+          properties:
+            user_id:
+              type: string
+              format: uuid
+            credits:
+              type: integer
+    CreateLinkedinProfileRequest:
+      type: object
+      required: [linkedin_url]
+      properties:
+        linkedin_url:
+          type: string
+          format: uri
+          description: Public LinkedIn profile URL.
+          example: https://www.linkedin.com/in/some-handle/
+    CreateAiProfileRequest:
+      type: object
+      required: [profile_id, job_title, job_description, tone]
+      properties:
+        profile_id:
+          type: string
+          format: uuid
+          description: Source profile to rewrite.
+        job_title:
+          type: string
+          example: Senior Backend Engineer
+        job_description:
+          type: string
+          description: The full job description text.
+        company_name:
+          type: string
+          description: Optional. If omitted the prompt leaves it blank.
+        tone:
+          type: string
+          enum: [professional, modern, executive, technical]
+          description: |
+            Writing register for the rewrite.
+            * `professional` — formal, polished, ATS-safe
+            * `modern` — direct, energetic, dynamic verbs
+            * `executive` — strategic, leadership- and outcomes-focused
+            * `technical` — precise, depth-forward, tools/metrics-heavy
+    CreateAiProfileSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code:
+          type: integer
+          example: 200
+        status:
+          type: string
+          enum: [success]
+        data:
+          type: object
+          properties:
+            profile_id:
+              type: string
+              format: uuid
+              description: |
+                The id of the newly created AI-optimised profile. Use
+                `/getProfileById?id=<profile_id>` to fetch the full row.
+    GoogleAuthRequest:
+      type: object
+      required: [id_token]
+      properties:
+        id_token:
+          type: string
+          description: |
+            Google ID token obtained on the client (e.g. via the Flutter
+            `google_sign_in` package). Must be issued for the Google client
+            ID configured in Supabase Auth → Providers → Google.
+        nonce:
+          type: string
+          description: |
+            Optional raw nonce. If provided, its SHA-256 hash must match the
+            `nonce` claim in the ID token. Recommended for anti-replay:
+            generate a random string client-side, send the SHA-256 hash to
+            Google Sign-In, and send the raw value here.
+    GoogleAuthSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code:
+          type: integer
+          example: 200
+        status:
+          type: string
+          enum: [success]
+        data:
+          type: object
+          properties:
+            user:
+              $ref: '#/components/schemas/User'
+            session:
+              $ref: '#/components/schemas/Session'
+            is_new_user:
+              type: boolean
+              description: |
+                `true` if the user was created by this call, `false` if they
+                already existed. Useful for routing to onboarding screens.
+    AppleAuthRequest:
+      type: object
+      required: [id_token]
+      properties:
+        id_token:
+          type: string
+          description: |
+            Apple identity token (JWT) obtained on the client via the
+            `sign_in_with_apple` package. Must be issued for the Bundle ID
+            or Services ID configured in Supabase Auth → Providers → Apple.
+        nonce:
+          type: string
+          description: |
+            Raw nonce generated client-side before initiating the Apple sign-in
+            flow. Recommended for anti-replay. Send the SHA-256 hash to Apple
+            and the raw value here — Supabase handles the comparison.
+        full_name:
+          type: string
+          nullable: true
+          description: |
+            User's full name as returned by Apple. Apple only provides this
+            on the **first** sign-in ever. The Flutter app must capture and
+            forward it here on that first call; the backend persists it to
+            `public.users.full_name` immediately.
+    AppleAuthSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code:
+          type: integer
+          example: 200
+        status:
+          type: string
+          enum: [success]
+        data:
+          type: object
+          properties:
+            user:
+              $ref: '#/components/schemas/User'
+            session:
+              $ref: '#/components/schemas/Session'
+            is_new_user:
+              type: boolean
+              description: |
+                `true` if the user was created by this call, `false` if they
+                already existed. Useful for routing to onboarding screens.
+    ResendOTPRequest:
+      type: object
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+    MessageSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code:
+          type: integer
+          example: 200
+        status:
+          type: string
+          enum: [success]
+        data:
+          type: object
+          properties:
+            message:
+              type: string
+    AuthSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code:
+          type: integer
+          example: 200
+        status:
+          type: string
+          enum: [success]
+        data:
+          $ref: '#/components/schemas/AuthData'
+    SignUpSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code:
+          type: integer
+          example: 200
+        status:
+          type: string
+          enum: [success]
+        data:
+          $ref: '#/components/schemas/SignUpData'
+    AuthData:
+      type: object
+      properties:
+        user:
+          $ref: '#/components/schemas/User'
+        session:
+          allOf:
+            - $ref: '#/components/schemas/Session'
+          nullable: true
+    SignUpData:
+      type: object
+      properties:
+        user:
+          $ref: '#/components/schemas/User'
+        session:
+          allOf:
+            - $ref: '#/components/schemas/Session'
+          nullable: true
+        email_verification_required:
+          type: boolean
+          description: |
+            `true` when the user must enter a 6-digit OTP via `/verifyEmail`
+            before they get a session.
+    FailureResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code:
+          type: integer
+          example: 400
+        status:
+          type: string
+          enum: [failure]
+        data:
+          type: object
+          required: [message]
+          properties:
+            message:
+              type: string
+              example: invalid credentials
+            code:
+              type: string
+              description: |
+                Machine-readable error code. Currently used:
+                  * `EMAIL_NOT_VERIFIED` — login attempted before verification; OTP resent.
+                  * `INVALID_OTP` — wrong or expired 6-digit code.
+                  * `OTP_RATE_LIMITED` — more than 5 OTPs generated for this email in 24h.
+                  * `EMAIL_ALREADY_REGISTERED` — sign-up attempted for an existing account.
+                  * `GOOGLE_ONLY_ACCOUNT` — password reset attempted for a Google-only account.
+              example: EMAIL_NOT_VERIFIED
+            retry_after_seconds:
+              type: integer
+              description: |
+                Present only on `OTP_RATE_LIMITED`. Seconds until the oldest
+                attempt rolls out of the 24h window and another OTP can be
+                generated.
+              example: 82800
+    User:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        user_metadata:
+          type: object
+          properties:
+            full_name:
+              type: string
+    UserRow:
+      type: object
+      description: A row from `public.users`.
+      properties:
+        id:
+          type: string
+          format: uuid
+        full_name:
+          type: string
+          nullable: true
+        email:
+          type: string
+          format: email
+        created_at:
+          type: string
+          format: date-time
+        phone_number:
+          type: string
+          nullable: true
+        country:
+          type: string
+          nullable: true
+        dob:
+          type: string
+          format: date
+          nullable: true
+        profile_picture_url:
+          type: string
+          format: uri
+          nullable: true
+        password_updated_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            Set whenever the user's password is created or changed
+            (covers signup, `/changePassword`, password resets, and any
+            admin-initiated change). `null` for OAuth-only accounts that
+            have never had a password.
+    UserProfile:
+      description: |
+        `UserRow` plus two computed flags pulled from `auth.users`.
+      allOf:
+        - $ref: '#/components/schemas/UserRow'
+        - type: object
+          properties:
+            is_google_user:
+              type: boolean
+              description: |
+                `true` if the account has Google as one of its auth providers.
+            is_email_verified:
+              type: boolean
+              description: |
+                `true` if the email has been confirmed (either via OTP or
+                because the OAuth provider asserts it's verified).
+    DeleteUserSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code:
+          type: integer
+          example: 200
+        status:
+          type: string
+          enum: [success]
+        data:
+          type: object
+          properties:
+            deleted:
+              type: boolean
+              example: true
+            user_id:
+              type: string
+              format: uuid
+    Profile:
+      type: object
+      description: |
+        A CV profile. Nested objects/arrays are stored as JSONB in
+        Postgres and round-trip as-is. The canonical document shape is
+        in `samples_and_scripts/profile_sample.json` in the repo.
+      properties:
+        id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+          description: Owner — set automatically from the auth token, ignored if present in request bodies.
+        profile_name:
+          type: string
+          nullable: true
+        profile_description:
+          type: string
+          nullable: true
+        profile_color:
+          type: string
+          nullable: true
+          description: Hex color, e.g. `#1E88E5`.
+        icon_asset:
+          type: string
+          nullable: true
+          description: Icon identifier the client maps to a rendered icon (e.g. `briefcase`).
+        contact_details:
+          type: object
+          nullable: true
+        about_yourself:
+          type: object
+          nullable: true
+        education_details_list:
+          type: array
+          items:
+            type: object
+        work_experience_list:
+          type: array
+          items:
+            type: object
+        skills_list:
+          type: array
+          items:
+            type: string
+        personal_projects_list:
+          type: array
+          items:
+            type: object
+        organization_list:
+          type: array
+          items:
+            type: object
+        certificates_list:
+          type: array
+          items:
+            type: object
+        languages_list:
+          type: array
+          items:
+            type: object
+        interests_list:
+          type: array
+          items:
+            type: string
+        created_at:
+          type: string
+          format: date-time
+        archived:
+          type: boolean
+          description: |
+            `false` for active profiles, `true` for archived. Toggled
+            only via `/archiveProfile`.
+        updated_at:
+          type: string
+          format: date-time
+    ArchiveProfileRequest:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+          format: uuid
+        archived:
+          type: boolean
+          default: true
+          description: |
+            `true` archives, `false` unarchives. Defaults to `true` if
+            omitted.
+    Export:
+      type: object
+      description: A row from `public.exports`.
+      properties:
+        id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        profile_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: |
+            Becomes `null` if the source profile is deleted (FK
+            `ON DELETE SET NULL`) — the snapshot in `data` lives on.
+        data:
+          type: object
+          description: Arbitrary JSON the frontend chose to snapshot.
+        created_at:
+          type: string
+          format: date-time
+    ExportRequest:
+      type: object
+      required: [profile_id]
+      properties:
+        profile_id:
+          type: string
+          format: uuid
+        data:
+          type: object
+          description: Defaults to `{}` if omitted.
+    ExportSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code:
+          type: integer
+          example: 200
+        status:
+          type: string
+          enum: [success]
+        data:
+          $ref: '#/components/schemas/Export'
+    DeleteExportSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code:
+          type: integer
+          example: 200
+        status:
+          type: string
+          enum: [success]
+        data:
+          type: object
+          properties:
+            deleted:
+              type: boolean
+              example: true
+            id:
+              type: string
+              format: uuid
+    ExportListSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code:
+          type: integer
+          example: 200
+        status:
+          type: string
+          enum: [success]
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Export'
+    UnarchiveProfileRequest:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+          format: uuid
+    DuplicateProfileRequest:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Source profile id to clone.
+    DeleteProfileSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code:
+          type: integer
+          example: 200
+        status:
+          type: string
+          enum: [success]
+        data:
+          type: object
+          properties:
+            deleted:
+              type: boolean
+              example: true
+            id:
+              type: string
+              format: uuid
+    ProfileUpsertRequest:
+      type: object
+      description: |
+        Body for `/createUpdateProfile`. All fields optional. If `id` is
+        present, this is an update (PATCH semantics — only included keys
+        are written). If absent, a new profile is created.
+      properties:
+        id:
+          type: string
+          format: uuid
+          nullable: true
+          description: Omit to create; include to update.
+        profile_name:
+          type: string
+          nullable: true
+        profile_description:
+          type: string
+          nullable: true
+        profile_color:
+          type: string
+          nullable: true
+        icon_asset:
+          type: string
+          nullable: true
+        contact_details:
+          type: object
+          nullable: true
+        about_yourself:
+          type: object
+          nullable: true
+        education_details_list:
+          type: array
+          items:
+            type: object
+        work_experience_list:
+          type: array
+          items:
+            type: object
+        skills_list:
+          type: array
+          items:
+            type: string
+        personal_projects_list:
+          type: array
+          items:
+            type: object
+        organization_list:
+          type: array
+          items:
+            type: object
+        certificates_list:
+          type: array
+          items:
+            type: object
+        languages_list:
+          type: array
+          items:
+            type: object
+        interests_list:
+          type: array
+          items:
+            type: string
+    ProfileSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code:
+          type: integer
+          example: 200
+        status:
+          type: string
+          enum: [success]
+        data:
+          $ref: '#/components/schemas/Profile'
+    ProfileListSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code:
+          type: integer
+          example: 200
+        status:
+          type: string
+          enum: [success]
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Profile'
+    PaginatedProfilesResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code:
+          type: integer
+          example: 200
+        status:
+          type: string
+          enum: [success]
+        data:
+          type: object
+          required: [items, total, limit, offset]
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/Profile'
+            total:
+              type: integer
+              description: Total number of matching rows (before limit/offset).
+            limit:
+              type: integer
+            offset:
+              type: integer
+    PaginatedExportsResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code:
+          type: integer
+          example: 200
+        status:
+          type: string
+          enum: [success]
+        data:
+          type: object
+          required: [items, total, limit, offset]
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/Export'
+            total:
+              type: integer
+            limit:
+              type: integer
+            offset:
+              type: integer
+    UpdateUserRequest:
+      type: object
+      description: |
+        Partial profile update. All fields are optional; only included keys
+        are written. Send `null` to clear a field.
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        full_name:
+          type: string
+          nullable: true
+        phone_number:
+          type: string
+          nullable: true
+        country:
+          type: string
+          nullable: true
+        dob:
+          type: string
+          format: date
+          nullable: true
+        profile_picture_url:
+          type: string
+          format: uri
+          nullable: true
+    UpdateUserSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code:
+          type: integer
+          example: 200
+        status:
+          type: string
+          enum: [success]
+        data:
+          $ref: '#/components/schemas/UserProfile'
+    UploadProfilePictureSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code:
+          type: integer
+          example: 200
+        status:
+          type: string
+          enum: [success]
+        data:
+          type: object
+          properties:
+            profile_picture_url:
+              type: string
+              format: uri
+    UserRowSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code:
+          type: integer
+          example: 200
+        status:
+          type: string
+          enum: [success]
+        data:
+          $ref: '#/components/schemas/UserProfile'
+    NavigationItem:
+      type: object
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+    QuickAction:
+      type: object
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        description:
+          type: string
+    AppContent:
+      type: object
+      properties:
+        navigation_bar_data:
+          type: array
+          items:
+            $ref: '#/components/schemas/NavigationItem'
+        quick_actions_data:
+          type: array
+          items:
+            $ref: '#/components/schemas/QuickAction'
+        isOffline:
+          type: boolean
+        isPro:
+          type: boolean
+        isPremiumMember:
+          type: boolean
+    AppContentSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code:
+          type: integer
+          example: 200
+        status:
+          type: string
+          enum: [success]
+        data:
+          $ref: '#/components/schemas/AppContent'
+    Session:
+      type: object
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        token_type:
+          type: string
+          example: bearer
+        expires_in:
+          type: integer
+        expires_at:
+          type: integer
+        user:
+          $ref: '#/components/schemas/User'
+    SubmitFeedbackRequest:
+      type: object
+      required: [type, message]
+      properties:
+        type:
+          type: string
+          enum: [bug, idea, praise, other]
+        subject:
+          type: string
+          nullable: true
+        message:
+          type: string
+        screenshot_url:
+          type: string
+          format: uri
+          nullable: true
+        screen_recording_url:
+          type: string
+          format: uri
+          nullable: true
+        diagnostics:
+          type: object
+          nullable: true
+          description: Device diagnostics — bug type only.
+          properties:
+            app_version: { type: string }
+            build_number: { type: string }
+            platform: { type: string }
+            os_version: { type: string }
+            device_brand: { type: string }
+            device_model: { type: string }
+            sdk_int: { type: integer }
+            locale: { type: string }
+            is_physical_device: { type: boolean }
+        logs:
+          type: array
+          items:
+            type: string
+          nullable: true
+          description: Log lines — bug type only.
+    FeedbackSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code: { type: integer, example: 200 }
+        status: { type: string, enum: [success] }
+        data:
+          type: object
+          properties:
+            id: { type: string, format: uuid }
+    RegisterDeviceRequest:
+      type: object
+      required: [fcm_token, platform]
+      properties:
+        fcm_token: { type: string }
+        platform: { type: string, enum: [android, ios] }
+        app_version: { type: string, nullable: true }
+    SimpleSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code: { type: integer, example: 200 }
+        status: { type: string, enum: [success] }
+        data: { type: object }
+    NotificationSettings:
+      type: object
+      properties:
+        user_id: { type: string, format: uuid }
+        marketing_emails: { type: boolean, default: true }
+        push_feature_announcements: { type: boolean, default: true }
+        push_engagement_reminders: { type: boolean, default: true }
+        reminders_start_hour:
+          type: integer
+          minimum: 0
+          maximum: 23
+          default: 9
+        reminders_end_hour:
+          type: integer
+          minimum: 0
+          maximum: 23
+          default: 21
+        updated_at: { type: string, format: date-time }
+    NotificationSettingsResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code: { type: integer, example: 200 }
+        status: { type: string, enum: [success] }
+        data:
+          $ref: '#/components/schemas/NotificationSettings'
+    SetSettingsRequest:
+      type: object
+      minProperties: 1
+      properties:
+        marketing_emails: { type: boolean }
+        push_feature_announcements: { type: boolean }
+        push_engagement_reminders: { type: boolean }
+        reminders_start_hour: { type: integer, minimum: 0, maximum: 23 }
+        reminders_end_hour: { type: integer, minimum: 0, maximum: 23 }
+    SendMarketingEmailRequest:
+      type: object
+      required: [subject, headline, body_html]
+      properties:
+        subject: { type: string }
+        headline: { type: string }
+        body_html: { type: string }
+        cta_text: { type: string, nullable: true }
+        cta_url: { type: string, format: uri, nullable: true }
+        user_ids:
+          type: array
+          items: { type: string, format: uuid }
+          nullable: true
+          description: Omit to send to all opted-in users.
+    SendFeatureNotificationRequest:
+      type: object
+      required: [title, body]
+      properties:
+        title: { type: string }
+        body: { type: string }
+        data:
+          type: object
+          additionalProperties: { type: string }
+          nullable: true
+    ProcessQueueSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code: { type: integer, example: 200 }
+        status: { type: string, enum: [success] }
+        data:
+          type: object
+          properties:
+            processed: { type: integer }
+            sent: { type: integer, nullable: true }
+            failed: { type: integer, nullable: true }
+    SyncProfileInput:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: |
+            Client-generated UUID from offline storage. If omitted a new
+            UUID is generated server-side.
+        profile_name: { type: string, nullable: true }
+        profile_description: { type: string, nullable: true }
+        profile_color: { type: string, nullable: true }
+        icon_asset: { type: string, nullable: true }
+        contact_details: { type: object, nullable: true }
+        about_yourself: { type: object, nullable: true }
+        education_details_list: { type: array, items: { type: object }, default: [] }
+        work_experience_list: { type: array, items: { type: object }, default: [] }
+        skills_list: { type: array, items: { type: string }, default: [] }
+        personal_projects_list: { type: array, items: { type: object }, default: [] }
+        organization_list: { type: array, items: { type: object }, default: [] }
+        certificates_list: { type: array, items: { type: object }, default: [] }
+        languages_list: { type: array, items: { type: object }, default: [] }
+        interests_list: { type: array, items: { type: string }, default: [] }
+        archived: { type: boolean, default: false }
+        created_at:
+          type: string
+          format: date-time
+          description: Preserve the original offline creation timestamp.
+    SyncProfilesRequest:
+      type: object
+      required: [profiles]
+      properties:
+        profiles:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/SyncProfileInput'
+    SyncProfilesSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code: { type: integer, example: 200 }
+        status: { type: string, enum: [success] }
+        data:
+          type: object
+          properties:
+            synced:
+              type: integer
+              description: Number of profiles submitted (including any skipped duplicates).
+            ids:
+              type: array
+              items: { type: string, format: uuid }
+              description: Server-side IDs in the same order as the request array.
+    SyncExportInput:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Client-generated UUID. If omitted a new UUID is generated.
+        profile_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: Must match an ID from a prior `/syncProfiles` call (or an existing profile).
+        data:
+          type: object
+          default: {}
+          description: Export metadata (format, template, etc.)
+        created_at:
+          type: string
+          format: date-time
+          description: Preserve the original offline export timestamp.
+    SyncExportsRequest:
+      type: object
+      required: [exports]
+      properties:
+        exports:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items:
+            $ref: '#/components/schemas/SyncExportInput'
+    SyncExportsSuccessResponse:
+      type: object
+      required: [status_code, status, data]
+      properties:
+        status_code: { type: integer, example: 200 }
+        status: { type: string, enum: [success] }
+        data:
+          type: object
+          properties:
+            synced:
+              type: integer
+              description: Number of exports submitted (including any skipped duplicates).
+            queued: { type: integer, nullable: true }

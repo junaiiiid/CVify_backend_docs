@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CVify 2.0 Backend API</title>
+    <link rel="icon" href="data:," />
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css"
+    />
+    <style>
+      body { margin: 0; background: #fafafa; }
+      .topbar { display: none; }
+    </style>
+  </head>
+  <body>
+    <div id="swagger-ui"></div>
+    <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js" crossorigin></script>
+    <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-standalone-preset.js" crossorigin></script>
+    <script>
+      const SUPABASE_ANON_KEY =
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InB0cnF2YnZ1eWRmcm53Ym14bHhpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg0OTYyMTMsImV4cCI6MjA5NDA3MjIxM30.hXj-z3wx8fC7kiXUN2DP0u2Fc0qNSf8QMZ5f-vUYzFg";
+
+      window.ui = SwaggerUIBundle({
+        url: "openapi.yml",
+        dom_id: "#swagger-ui",
+        deepLinking: true,
+        persistAuthorization: true,
+        tryItOutEnabled: true,
+        displayRequestDuration: true,
+        presets: [
+          SwaggerUIBundle.presets.apis,
+          SwaggerUIStandalonePreset,
+        ],
+        layout: "BaseLayout",
+        onComplete: () => {
+          window.ui.preauthorizeApiKey("supabaseAnonKey", SUPABASE_ANON_KEY);
+        },
+      });
+    </script>
+  </body>
+</html>
